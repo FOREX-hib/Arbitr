@@ -1,13 +1,10 @@
 services:
   - type: worker
     name: arb-bot
-    runtime: python
-    runtimeVersion: python-3.11.8
+    runtime: docker
     envVars:
       - key: TELEGRAM_TOKEN
         generateValue: true
-    buildCommand: |
-      pip install --upgrade pip
-      pip install -r requirements.txt
+    buildCommand: echo "Building with Docker"
     startCommand: python bot.py
     plan: free
