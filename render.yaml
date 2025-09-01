@@ -2,6 +2,7 @@ services:
   - type: worker
     name: arb-bot
     runtime: python
+    runtimeVersion: python-3.11.8
     envVars:
       - key: TELEGRAM_TOKEN
         generateValue: true
