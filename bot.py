@@ -1,18 +1,24 @@
 # bot.py
 import logging
 import sqlite3
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, JobQueue
 from telegram import Update
 import ccxt
 import os
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from contextlib import contextmanager
 
 # Настройка логирования
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # === НАСТРОЙКИ ===
 TOKEN = os.getenv("TELEGRAM_TOKEN")
+if not TOKEN:
+    raise ValueError("Требуется переменная окружения TELEGRAM_TOKEN")
+
 THRESHOLD = 1.5  # Минимальная разница в %
 symbols = ['BTC/USDT', 'ETH/USDT']
 
@@ -20,63 +26,94 @@ symbols = ['BTC/USDT', 'ETH/USDT']
 exchanges = {
     'binance': ccxt.binance(),
     'bybit': ccxt.bybit(),
-    'kucoin': ccxt.kucoin()
+    'kucoin': ccxt.kucoin(),
 }
 
-# Подключение к БД
+# Путь к БД (Render позволяет писать только в /tmp)
+DB_PATH = '/tmp/users.db'
+
+# === КОНТЕКСТНЫЙ МЕНЕДЖЕР ДЛЯ БД ===
+@contextmanager
+def get_db():
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    try:
+        yield conn
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        conn.close()
+
+# === РАБОТА С БАЗОЙ ДАННЫХ ===
 def init_db():
-    conn = sqlite3.connect('/tmp/users.db')
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            is_premium INTEGER DEFAULT 0,
-            joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    conn.commit()
-    conn.close()
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    is_premium INTEGER DEFAULT 0,
+                    joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            conn.commit()
+            logger.info("✅ База данных инициализирована")
+    except Exception as e:
+        logger.error(f"❌ Ошибка при инициализации БД: {e}")
 
-def add_user(user_id, username):
-    conn = sqlite3.connect('users.db')
-    c = conn.cursor()
-    c.execute('INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)', (user_id, username))
-    conn.commit()
-    conn.close()
+def add_user(user_id: int, username: str):
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute('''
+                INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)
+            ''', (user_id, username))
+            conn.commit()
+    except Exception as e:
+        logger.error(f"❌ Ошибка добавления пользователя {user_id}: {e}")
 
-def is_premium(user_id):
-    conn = sqlite3.connect('users.db')
-    c = conn.cursor()
-    c.execute('SELECT is_premium FROM users WHERE user_id = ?', (user_id,))
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else False
+def is_premium(user_id: int) -> bool:
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute('SELECT is_premium FROM users WHERE user_id = ?', (user_id,))
+            row = c.fetchone()
+            return bool(row[0]) if row else False
+    except Exception as e:
+        logger.error(f"❌ Ошибка проверки премиума для {user_id}: {e}")
+        return False
 
-def set_premium(user_id):
-    conn = sqlite3.connect('users.db')
-    c = conn.cursor()
-    c.execute('UPDATE users SET is_premium = 1 WHERE user_id = ?', (user_id,))
-    conn.commit()
-    conn.close()
+def set_premium(user_id: int):
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute('UPDATE users SET is_premium = 1 WHERE user_id = ?', (user_id,))
+            conn.commit()
+            logger.info(f"🎉 Пользователь {user_id} стал Premium")
+    except Exception as e:
+        logger.error(f"❌ Ошибка при установке Premium для {user_id}: {e}")
 
-# === ПЛАНИРОВЩИК АЛЕРТОВ ===
-scheduler = AsyncIOScheduler()
-
+# === АЛЕРТ: АРБИТРАЖ ===
 async def check_arbitrage(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
     user_id = job.user_id
+
+    # Проверяем, что пользователь всё ещё премиум
     if not is_premium(user_id):
-        return  # Только премиум получают алерты (Free — не получают в этом примере)
+        logger.info(f"🚫 Пользователь {user_id} больше не Premium — останавливаем алерты")
+        context.job.schedule_removal()
+        return
 
     for symbol in symbols:
         prices = {}
         for name, exchange in exchanges.items():
             try:
                 ticker = exchange.fetch_ticker(symbol)
-                prices[name] = ticker['last']
+                if ticker and 'last' in ticker:
+                    prices[name] = ticker['last']
             except Exception as e:
-                logger.error(f"{name}: {e}")
+                logger.warning(f"⚠️ Не удалось получить цену с {name}: {e}")
 
         if len(prices) < 2:
             continue
@@ -90,21 +127,25 @@ async def check_arbitrage(context: ContextTypes.DEFAULT_TYPE):
             max_ex = [k for k, v in prices.items() if v == max_price][0]
 
             message = f"""
-🚨 **АРБИТРАЖ** ({symbol})
-📉 {min_ex}: ${min_price:,.2f}
-📈 {max_ex}: ${max_price:,.2f}
+🚨 **АРБИТРАЖ ОБНАРУЖЕН** ({symbol})
+📉 Дешевле: {min_ex.upper()} — ${min_price:,.2f}
+📈 Дороже: {max_ex.upper()} — ${max_price:,.2f}
 📊 Разница: **{spread:.2f}%**
-🔗 [Buy on {min_ex}]({exchanges[min_ex].urls['www']})
+🕒 {context.job.next_t.strftime('%H:%M:%S')}
+🔗 [Купить на {min_ex}]({exchanges[min_ex].urls['www']})
             """
             try:
                 await context.bot.send_message(
                     chat_id=user_id,
-                    text=message,
-                    parse_mode='Markdown'
+                    text=message.strip(),
+                    parse_mode='Markdown',
+                    disable_web_page_preview=False
                 )
+                logger.info(f"✅ Алерт отправлен {user_id}: {spread:.2f}% на {symbol}")
             except Exception as e:
-                logger.error(f"Не удалось отправить пользователю {user_id}: {e}")
-                scheduler.remove_job(f"job_{user_id}")
+                logger.error(f"❌ Не удалось отправить {user_id}: {e}")
+                if "blocked" in str(e).lower() or "kicked" in str(e).lower():
+                    context.job.schedule_removal()
 
 # === КОМАНДЫ ===
 async def start(update: Update, context):
@@ -114,12 +155,11 @@ async def start(update: Update, context):
         f"👋 Привет, {user.first_name}!\n\n"
         "Я — **ArbHunterBot**. Слежу за ценами на криптовалюты и присылаю сигналы арбитража.\n\n"
         "🔹 /prices — текущие цены\n"
-        "🔸 /subscribe — как стать Premium\n"
+        "🔸 /subscribe — тарифы\n"
         "💎 /premium — активировать Premium (временно бесплатно)"
     )
 
 async def prices(update: Update, context):
-    user_id = update.effective_user.id
     reply = "📊 Текущие цены:\n\n"
     for symbol in symbols:
         reply += f"**{symbol}**\n"
@@ -127,10 +167,10 @@ async def prices(update: Update, context):
             try:
                 price = exchange.fetch_ticker(symbol)['last']
                 reply += f"  {name}: ${price:,.2f}\n"
-            except:
+            except Exception as e:
                 reply += f"  {name}: ошибка\n"
         reply += "\n"
-    await update.message.reply_text(reply, parse_mode='Markdown')
+    await update.message.reply_text(reply.strip(), parse_mode='Markdown')
 
 async def subscribe(update: Update, context):
     text = """
@@ -143,23 +183,25 @@ async def subscribe(update: Update, context):
 
 👉 Пока что активация временно **бесплатна** через /premium
     """
-    await update.message.reply_text(text, parse_mode='Markdown')
+    await update.message.reply_text(text.strip(), parse_mode='Markdown')
 
 async def premium(update: Update, context):
     user_id = update.effective_user.id
+
+    # Удаляем старые задачи
+    job_name = f"arb_alert_{user_id}"
+    current_jobs = context.job_queue.get_jobs_by_name(job_name)
+    for job in current_jobs:
+        job.schedule_removal()
+
+    # Даём премиум
     set_premium(user_id)
 
-    # Удаляем старую задачу (если есть)
-    job_name = f"job_{user_id}"
-    if context.job_queue.get_jobs_by_name(job_name):
-        for job in context.job_queue.get_jobs_by_name(job_name):
-            job.schedule_removal()
-
-    # Добавляем задачу с интервалом 15 сек (только для Premium)
+    # Запускаем алерты
     context.job_queue.run_repeating(
         check_arbitrage,
         interval=15,
-        first=10,
+        first=5,
         name=job_name,
         user_id=user_id
     )
@@ -167,12 +209,12 @@ async def premium(update: Update, context):
     await update.message.reply_text(
         "🎉 Поздравляю! Ты — **Premium пользователь**!\n"
         "Теперь ты будешь получать алерты каждые 15 секунд.\n\n"
-        "Чтобы отключить — перезапусти бота или напиши /stop"
+        "Чтобы отключить — напиши /stop"
     )
 
 async def stop(update: Update, context):
     user_id = update.effective_user.id
-    job_name = f"job_{user_id}"
+    job_name = f"arb_alert_{user_id}"
     jobs = context.job_queue.get_jobs_by_name(job_name)
     for job in jobs:
         job.schedule_removal()
@@ -180,19 +222,26 @@ async def stop(update: Update, context):
 
 # === ЗАПУСК ===
 def main():
+    # Инициализация БД
     init_db()
 
-    app = Application.builder().token(TOKEN).build()
+    # Создаём приложение
+    try:
+        app = Application.builder().token(TOKEN).build()
+        logger.info("🤖 Бот: токен загружен")
+    except Exception as e:
+        logger.critical(f"❌ Ошибка токена: {e}")
+        raise
 
+    # Хэндлеры
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("prices", prices))
     app.add_handler(CommandHandler("subscribe", subscribe))
     app.add_handler(CommandHandler("premium", premium))
     app.add_handler(CommandHandler("stop", stop))
 
-    scheduler.start()
-    logger.info("Бот запущен и работает...")
-
+    # Запуск
+    logger.info("🚀 Бот запускается...")
     app.run_polling()
 
 if __name__ == '__main__':
